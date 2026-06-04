@@ -4,6 +4,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -624,6 +625,7 @@ def store_conversation_history(
     try:
         if response is None:
             response = ""
+        response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
         if config.conversation_cache is not None:
             logger.info("%s Storing conversation history", conversation_id)
             query_message = HumanMessage(content=llm_request.query)

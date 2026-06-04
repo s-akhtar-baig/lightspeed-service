@@ -1120,6 +1120,17 @@ class QuotaHandlersConfig(BaseModel):
         self.enable_token_history = data.get("enable_token_history", False)
 
 
+class InferenceScalingConfig(BaseModel):
+    """Configuration for inference-time scaling via its_hub."""
+
+    algorithm: str = "self_consistency"
+    budget: PositiveInt = 1
+    tool_vote: str = "tool_hierarchical"
+    exclude_args: Optional[list[str]] = None
+    judge_model: Optional[str] = None
+    judge_criterion: Optional[str] = None
+
+
 class OLSConfig(BaseModel):
     """OLS configuration."""
 
@@ -1134,6 +1145,7 @@ class OLSConfig(BaseModel):
     default_provider: Optional[str] = None
     default_model: Optional[str] = None
     max_iterations: Optional[PositiveInt] = None
+    inference_scaling: InferenceScalingConfig = InferenceScalingConfig()
     history_compression_enabled: bool = True
     expire_llm_is_ready_persistent_state: Optional[int] = -1
     max_workers: Optional[int] = None
@@ -1176,6 +1188,8 @@ class OLSConfig(BaseModel):
         self.default_provider = data.get("default_provider", None)
         self.default_model = data.get("default_model", None)
         self.max_iterations = data.get("max_iterations")
+        inference_scaling_data = data.get("inference_scaling", {})
+        self.inference_scaling = InferenceScalingConfig(**inference_scaling_data)
         self.history_compression_enabled = data.get("history_compression_enabled", True)
         self.max_workers = data.get("max_workers", 1)
         self.expire_llm_is_ready_persistent_state = data.get(

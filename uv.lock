@@ -1281,6 +1281,7 @@ dependencies = [
     { name = "gradio-client" },
     { name = "typer" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/ce/86/c9694b7cfada5780e75769e60dc161a161f4dd7fc91b61db5e3a3338bef9/hf_gradio-0.4.1.tar.gz", hash = "sha256:a017d942618f0d495a58ee4563047fa04bef614c00e0cb789a9a6d0633cffa7b", size = 6560, upload-time = "2026-04-22T14:01:32.334Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/30/2d/afff2ee87e75d8eb85c92bb8cf0e15b05c23c2ebd8fd8dec781d8601ed7f/hf_gradio-0.4.1-py3-none-any.whl", hash = "sha256:76b8cb8be6abe62d74c1ad2d35b42f0629db89aa9e1a8d033cecfe7c856eeab3", size = 4482, upload-time = "2026-04-17T19:53:31.827Z" },
 ]
@@ -1505,6 +1506,28 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ef/7c/ec4ab396d31b3b395e2e999c8f46dec78c5e29209fac49d1f4dace04041d/isort-8.0.1.tar.gz", hash = "sha256:171ac4ff559cdc060bcfff550bc8404a486fee0caab245679c2abe7cb253c78d", size = 769592, upload-time = "2026-02-28T10:08:20.685Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3e/95/c7c34aa53c16353c56d0b802fba48d5f5caa2cdee7958acbcb795c830416/isort-8.0.1-py3-none-any.whl", hash = "sha256:28b89bc70f751b559aeca209e6120393d43fbe2490de0559662be7a9787e3d75", size = 89733, upload-time = "2026-02-28T10:08:19.466Z" },
+]
+
+[[package]]
+name = "its-hub"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4a/3b/a3ef1d7407ee1d324ad217f5249d22652ce8d0b454b83592704e094ca8ab/its_hub-1.0.0.tar.gz", hash = "sha256:32a7c20cdf4853f6959a0c7b48be305dad8a534a55f52fb6e1194e3aa4f1dc3b", size = 121943, upload-time = "2026-04-09T20:38:48.557Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/82/b1/b93492dc4671339fb594dfa1641a01a8f0dc102523a40c98f751ff31fee7/its_hub-1.0.0-py3-none-any.whl", hash = "sha256:1e9e78049508fb07a15f0ebeebd57dbcf66bcf026ca21f283dbca42e021a72f4", size = 48130, upload-time = "2026-04-09T20:38:46.915Z" },
+]
+
+[package.optional-dependencies]
+lm = [
+    { name = "aiohttp" },
+    { name = "backoff" },
+    { name = "certifi" },
+    { name = "openai" },
+    { name = "requests" },
 ]
 
 [[package]]
@@ -2753,6 +2776,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "ibm-watsonx-ai" },
+    { name = "its-hub", extra = ["lm"] },
     { name = "jinja2" },
     { name = "kubernetes" },
     { name = "langchain" },
@@ -2840,6 +2864,7 @@ requires-dist = [
     { name = "fastparquet", marker = "extra == 'evaluation'", specifier = ">=2024.11.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "ibm-watsonx-ai", specifier = ">=1.3.6" },
+    { name = "its-hub", extras = ["lm"], specifier = ">=1.0.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "kubernetes", specifier = "<34.1.0" },
     { name = "langchain", specifier = ">=0.3.12" },

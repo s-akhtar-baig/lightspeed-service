@@ -8,16 +8,18 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, TypeAlias
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 from langchain_core.messages.ai import AIMessageChunk
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools.structured import StructuredTool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from ols import constants
 from ols.app.metrics import TokenMetricUpdater
 from ols.app.metrics.token_counter import GenericTokenCounter
-from ols.app.models.config import ModelConfig
+from ols.app.models.config import InferenceScalingConfig, ModelConfig, ProviderConfig
 from ols.app.models.models import RagChunk, StreamChunkType, StreamedChunk
+from ols.src.tools.inference_scaling import run_scaling
 from ols.src.tools.tools import enforce_tool_token_budget, execute_tool_calls_stream
 from ols.utils.token_handler import TokenBudgetTracker, TokenCategory
 
@@ -110,6 +112,65 @@ def tool_calls_from_tool_calls_chunks(
     return response.tool_calls
 
 
+def _langchain_role(msg: BaseMessage) -> str:
+    """Map a LangChain message to an OpenAI role string."""
+    if isinstance(msg, AIMessage):
+        return "assistant"
+    if isinstance(msg, ToolMessage):
+        return "tool"
+    if isinstance(msg, SystemMessage):
+        return "system"
+    return "user"
+
+
+def _langchain_messages_to_openai(
+    prompt: ChatPromptTemplate,
+    llm_input_values: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Convert a LangChain ChatPromptTemplate to OpenAI-format message dicts."""
+    formatted = prompt.format_messages(**llm_input_values)
+    openai_messages: list[dict[str, Any]] = []
+    for msg in formatted:
+        entry: dict[str, Any] = {"role": _langchain_role(msg), "content": msg.content}
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            entry["tool_calls"] = [
+                {
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc.get("args", {})),
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+            entry["content"] = entry["content"] or None
+        if hasattr(msg, "tool_call_id") and msg.tool_call_id:
+            entry["role"] = "tool"
+            entry["tool_call_id"] = msg.tool_call_id
+        openai_messages.append(entry)
+    return openai_messages
+
+
+def _openai_tool_calls_to_langchain(
+    tool_calls: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert OpenAI-format tool_calls to LangChain format."""
+    result: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        try:
+            args = json.loads(tc["function"]["arguments"])
+        except (json.JSONDecodeError, KeyError):
+            logger.warning("Skipping malformed tool call from scaling: %s", tc)
+            continue
+        result.append({
+            "name": tc["function"]["name"],
+            "args": args,
+            "id": tc.get("id", ""),
+        })
+    return result
+
+
 class LLMExecutionAgent:
     """Agent that drives the iterative LLM + tool-calling loop."""
 
@@ -122,6 +183,8 @@ class LLMExecutionAgent:
         model_config: ModelConfig,
         streaming: bool,
         token_budget_tracker: TokenBudgetTracker,
+        provider_config: ProviderConfig | None = None,
+        scaling_config: InferenceScalingConfig | None = None,
     ) -> None:
         """Initialize the tool calling agent.
 
@@ -133,6 +196,8 @@ class LLMExecutionAgent:
             model_config: Model configuration (token budgets).
             streaming: Whether the request uses the streaming endpoint.
             token_budget_tracker: Shared per-request token budget tracker.
+            provider_config: LLM provider config (URL, credentials).
+            scaling_config: Inference-time scaling config.
         """
         self.bare_llm = bare_llm
         self.model = model
@@ -141,6 +206,9 @@ class LLMExecutionAgent:
         self.model_config = model_config
         self.streaming = streaming
         self._tracker = token_budget_tracker
+        self._provider_config = provider_config
+        self._scaling_config = scaling_config or InferenceScalingConfig()
+        self._use_scaling = self._scaling_config.budget > 1
 
     async def execute(
         self,
@@ -266,71 +334,156 @@ class LLMExecutionAgent:
         all_tools_dict, duplicate_tool_names = self._dedupe_tools_by_name(all_mcp_tools)
         self._charge_tool_definitions_tokens(all_mcp_tools, tool_definitions_tokens)
 
+        scaling_cfg = self._scaling_config
+
         for i in range(1, max_rounds + 1):
             is_final_round = (not all_mcp_tools) or (i == max_rounds)
             logger.debug("Tool calling round %s (final: %s)", i, is_final_round)
 
-            round_result = RoundLLMResult()
-            async for chunk in self._collect_round_llm_chunks(
-                messages=messages,
-                llm_input_values=llm_input_values,
-                all_mcp_tools=all_mcp_tools,
-                is_final_round=is_final_round,
-                token_counter=token_counter,
-                round_index=i,
-                result=round_result,
-            ):
-                yield chunk
-            if round_result.should_stop:
-                log_tool_loop_iteration(self._tracker, i, max_rounds, "llm_stream_stop")
-                return
+            apply_scaling = (
+                self._use_scaling
+                and not is_final_round
+                and all_mcp_tools
+                and self._provider_config is not None
+                and self._provider_config.url is not None
+            )
 
-            if is_final_round:
-                log_tool_loop_iteration(self._tracker, i, max_rounds, "final_round")
-                break
+            scaling_tool_calls: list[dict[str, object]] | None = None
 
-            if not round_result.tool_call_chunks:
-                log_tool_loop_iteration(
-                    self._tracker, i, max_rounds, "model_finished_without_tools"
+            if apply_scaling:
+                openai_messages = _langchain_messages_to_openai(
+                    messages, llm_input_values
                 )
-                break
-
-            try:
-                async for streamed_chunk in self._process_tool_calls_for_round(
-                    round_index=i,
-                    tool_call_chunks=round_result.tool_call_chunks,
-                    all_chunks=round_result.all_chunks,
-                    all_tools_dict=all_tools_dict,
-                    duplicate_tool_names=duplicate_tool_names,
-                    messages=messages,
-                    offload_manager=offload_manager,
-                ):
-                    yield streamed_chunk
-
-                if (
-                    offload_manager is not None
-                    and offload_manager.has_offloaded_content
-                    and not offload_manager.retrieval_tools_registered
-                ):
-                    retrieval_tools = offload_manager.build_retrieval_tools()
-                    for rt in retrieval_tools:
-                        all_mcp_tools.append(rt)
-                        all_tools_dict[rt.name] = rt
-                    offload_manager.mark_retrieval_tools_registered()
-                    logger.info(
-                        "Registered offload retrieval tools: %s",
-                        [rt.name for rt in retrieval_tools],
+                openai_tools = [
+                    convert_to_openai_tool(t) for t in all_mcp_tools
+                ]
+                try:
+                    scaling_result = await run_scaling(
+                        messages=openai_messages,
+                        tool_schemas=openai_tools,
+                        provider_endpoint=str(self._provider_config.url),
+                        api_key=self._provider_config.credentials or "",
+                        model_name=self.model,
+                        scaling_config={
+                            "algorithm": scaling_cfg.algorithm,
+                            "budget": scaling_cfg.budget,
+                            "tool_vote": scaling_cfg.tool_vote,
+                            "exclude_args": scaling_cfg.exclude_args,
+                            "judge_model": scaling_cfg.judge_model,
+                            "judge_criterion": scaling_cfg.judge_criterion,
+                        },
+                        round_num=i,
                     )
-            except Exception:
-                log_tool_loop_iteration(
-                    self._tracker, i, max_rounds, "tool_execution_failed"
+                except BaseException:
+                    logger.exception(
+                        "Inference scaling failed in round %d, "
+                        "falling back to standard path",
+                        i,
+                    )
+                    scaling_result = None
+                if scaling_result and scaling_result.get("tool_calls"):
+                    scaling_tool_calls = _openai_tool_calls_to_langchain(
+                        scaling_result["tool_calls"]
+                    )
+
+            if scaling_tool_calls is not None:
+                # Scaling path: we have tool calls from majority vote,
+                # process them directly without streaming LLM chunks.
+                try:
+                    async for sc in self._process_scaling_tool_calls(
+                        round_index=i,
+                        tool_calls=scaling_tool_calls,
+                        all_tools_dict=all_tools_dict,
+                        duplicate_tool_names=duplicate_tool_names,
+                        messages=messages,
+                        offload_manager=offload_manager,
+                    ):
+                        yield sc
+                except Exception:
+                    log_tool_loop_iteration(
+                        self._tracker, i, max_rounds, "tool_execution_failed"
+                    )
+                    logger.exception(
+                        "Error executing scaled tool calls in round %s", i
+                    )
+                    yield StreamedChunk(
+                        type=StreamChunkType.TEXT,
+                        text="I could not complete this request. Please try again.",
+                    )
+                    return
+            else:
+                # Standard path: stream LLM chunks and process tool calls.
+                round_result = RoundLLMResult()
+                async for chunk in self._collect_round_llm_chunks(
+                    messages=messages,
+                    llm_input_values=llm_input_values,
+                    all_mcp_tools=all_mcp_tools,
+                    is_final_round=is_final_round,
+                    token_counter=token_counter,
+                    round_index=i,
+                    result=round_result,
+                ):
+                    yield chunk
+                if round_result.should_stop:
+                    log_tool_loop_iteration(
+                        self._tracker, i, max_rounds, "llm_stream_stop"
+                    )
+                    return
+
+                if is_final_round:
+                    log_tool_loop_iteration(
+                        self._tracker, i, max_rounds, "final_round"
+                    )
+                    break
+
+                if not round_result.tool_call_chunks:
+                    log_tool_loop_iteration(
+                        self._tracker,
+                        i,
+                        max_rounds,
+                        "model_finished_without_tools",
+                    )
+                    break
+
+                try:
+                    async for streamed_chunk in self._process_tool_calls_for_round(
+                        round_index=i,
+                        tool_call_chunks=round_result.tool_call_chunks,
+                        all_chunks=round_result.all_chunks,
+                        all_tools_dict=all_tools_dict,
+                        duplicate_tool_names=duplicate_tool_names,
+                        messages=messages,
+                        offload_manager=offload_manager,
+                    ):
+                        yield streamed_chunk
+                except Exception:
+                    log_tool_loop_iteration(
+                        self._tracker, i, max_rounds, "tool_execution_failed"
+                    )
+                    logger.exception(
+                        "Error executing tool calls in round %s", i
+                    )
+                    yield StreamedChunk(
+                        type=StreamChunkType.TEXT,
+                        text="I could not complete this request. Please try again.",
+                    )
+                    return
+
+            if (
+                offload_manager is not None
+                and offload_manager.has_offloaded_content
+                and not offload_manager.retrieval_tools_registered
+            ):
+                retrieval_tools = offload_manager.build_retrieval_tools()
+                for rt in retrieval_tools:
+                    all_mcp_tools.append(rt)
+                    all_tools_dict[rt.name] = rt
+                offload_manager.mark_retrieval_tools_registered()
+                logger.info(
+                    "Registered offload retrieval tools: %s",
+                    [rt.name for rt in retrieval_tools],
                 )
-                logger.exception("Error executing tool calls in round %s", i)
-                yield StreamedChunk(
-                    type=StreamChunkType.TEXT,
-                    text="I could not complete this request. Please try again.",
-                )
-                return
+
             log_tool_loop_iteration(
                 self._tracker, i, max_rounds, "after_tool_execution"
             )
@@ -372,7 +525,15 @@ class LLMExecutionAgent:
         try:
             async for chunk in chain.astream(
                 input=llm_input_values,
-                config={"callbacks": [token_counter]},
+                config={
+                    "callbacks": [token_counter],
+                    "metadata": {
+                        "model": self.model,
+                        "query": llm_input_values.get("query", ""),
+                        "budget": self._scaling_config.budget,
+                        "tool_vote": self._scaling_config.tool_vote or "",
+                    },
+                },
             ):
                 yield chunk  # type: ignore [misc]
         except Exception:
@@ -825,6 +986,99 @@ class LLMExecutionAgent:
 
         for tool_call_message in all_tool_messages:
             tool_name = tool_id_to_name.get(tool_call_message.tool_call_id, "unknown")
+            content_token_count, tool_result_chunk = (
+                self._tool_result_chunk_for_message(
+                    tool_call_message=tool_call_message,
+                    tool_name=tool_name,
+                    tool=all_tools_dict.get(tool_name),
+                    round_index=round_index,
+                )
+            )
+            self._tracker.charge(TokenCategory.TOOL_RESULT, content_token_count)
+            yield tool_result_chunk
+
+    async def _process_scaling_tool_calls(
+        self,
+        *,
+        round_index: int,
+        tool_calls: list[dict[str, object]],
+        all_tools_dict: dict[str, StructuredTool],
+        duplicate_tool_names: set[str],
+        messages: ChatPromptTemplate,
+        offload_manager: "OffloadManager | None" = None,
+    ) -> AsyncGenerator[StreamedChunk, None]:
+        """Process tool calls from inference-time scaling (no LLM chunks)."""
+        tool_call_definitions, skipped_tool_messages = (
+            self._resolve_tool_call_definitions(
+                tool_calls, all_tools_dict, duplicate_tool_names
+            )
+        )
+        if not tool_call_definitions and not skipped_tool_messages:
+            return
+
+        ai_tool_call_message = AIMessage(
+            content="", type="ai", tool_calls=tool_calls
+        )
+        messages.append(ai_tool_call_message)
+
+        ai_message_tokens = self._tracker.count_tokens(json.dumps(tool_calls))
+        self._tracker.charge(TokenCategory.AI_ROUND, ai_message_tokens)
+
+        tool_id_to_name: dict[str, str] = {
+            str(tc.get("id", "")): str(tc.get("name", "unknown"))
+            for tc in tool_calls
+        }
+
+        for tool_call in tool_calls:
+            enriched: dict[str, Any] = {**tool_call}
+            tool_name = str(tool_call.get("name", "unknown"))
+            self._enrich_with_tool_metadata(enriched, all_tools_dict.get(tool_name))
+            yield StreamedChunk(type=StreamChunkType.TOOL_CALL, data=enriched)
+
+        tool_calls_messages: list[ToolMessage] = []
+        remaining = self._tracker.tools_round_budget
+        if tool_call_definitions:
+            if remaining < MIN_TOOL_EXECUTION_TOKENS:
+                for tool_id, _tool_args, tool in tool_call_definitions:
+                    tool_calls_messages.append(
+                        ToolMessage(
+                            content=(
+                                f"Tool '{tool.name}' call skipped: remaining tool "
+                                f"token budget ({remaining}) is below minimum "
+                                f"required ({MIN_TOOL_EXECUTION_TOKENS}). "
+                                "Do not retry this exact tool call."
+                            ),
+                            status="error",
+                            tool_call_id=tool_id,
+                        )
+                    )
+            else:
+                async for execution_event in execute_tool_calls_stream(
+                    tool_call_definitions,
+                    remaining,
+                    streaming=self.streaming,
+                    offload_manager=offload_manager,
+                ):
+                    match execution_event.event:
+                        case StreamChunkType.APPROVAL_REQUIRED:
+                            yield StreamedChunk(
+                                type=StreamChunkType.APPROVAL_REQUIRED,
+                                data=execution_event.data,
+                            )
+                        case StreamChunkType.TOOL_RESULT:
+                            tool_calls_messages.append(execution_event.data)
+
+        all_tool_messages = skipped_tool_messages + tool_calls_messages
+        if remaining > 0:
+            all_tool_messages = enforce_tool_token_budget(
+                all_tool_messages, remaining, self._tracker.token_handler
+            )
+        messages.extend(all_tool_messages)
+
+        for tool_call_message in all_tool_messages:
+            tool_name = tool_id_to_name.get(
+                tool_call_message.tool_call_id, "unknown"
+            )
             content_token_count, tool_result_chunk = (
                 self._tool_result_chunk_for_message(
                     tool_call_message=tool_call_message,

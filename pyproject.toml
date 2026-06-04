@@ -132,6 +132,7 @@ dependencies = [
     "qdrant-client>=1.13.3",  # For ToolsRAG vector storage (pure Python, no Rust/Cargo)
     "rank-bm25>=0.2.2",  # For ToolsRAG sparse retrieval
     "python-frontmatter>=1.1.0",  # For parsing skill YAML frontmatter
+    "its-hub[lm]>=1.0.0",
 ]
 requires-python = ">=3.12,<3.13"
 readme = "README.md"

@@ -112,6 +112,8 @@ class DocsSummarizer(QueryHelper):
             model_config=self.model_config,
             streaming=self.streaming,
             token_budget_tracker=self._tracker,
+            provider_config=self.provider_config,
+            scaling_config=config.ols_config.inference_scaling,
         )
 
     def _prepare_llm(self) -> None:
