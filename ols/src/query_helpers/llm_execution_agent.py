@@ -131,7 +131,13 @@ def _langchain_messages_to_openai(
     formatted = prompt.format_messages(**llm_input_values)
     openai_messages: list[dict[str, Any]] = []
     for msg in formatted:
-        entry: dict[str, Any] = {"role": _langchain_role(msg), "content": msg.content}
+        content = msg.content
+        # LangChain can store tool calls as content list items with type
+        # "function_call" — OpenAI rejects this content type, and the data
+        # is already captured in the tool_calls field below.
+        if isinstance(content, list):
+            content = [c for c in content if c.get("type") != "function_call"] or None
+        entry: dict[str, Any] = {"role": _langchain_role(msg), "content": content}
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             entry["tool_calls"] = [
                 {
